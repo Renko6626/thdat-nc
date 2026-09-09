@@ -1,8 +1,8 @@
 # thdat-nc
 
 `thdat-nc` 是针对 `PKGL` 归档的实验性命令行读取器，界面沿用 THTK `thdat` 的
-`-l` / `-x` 习惯。当前支持目录解密、逐条目 payload 解密、Zstandard 解压、完整列表、
-全量解包和指定文件解包；不支持创建或修改归档。
+`-l` / `-x` / `-c` 习惯。当前支持目录解密、逐条目 payload 解密、Zstandard 解压、
+完整列表、全量或指定文件解包，以及从目录创建确定性的 PKGL 归档。
 
 格式实现来自对研究者自有游戏副本的独立分析。仓库中的自动测试只生成原创的微型 PKGL
 夹具，不包含游戏归档、纹理、脚本或游戏可执行文件字节。
@@ -30,7 +30,28 @@ sha256sum -c SHA256SUMS
 
 # 只解包指定文件
 .\thdat-nc.exe -x -C C:\temp\th06ST C:\games\th06nc\data\th06ST.dat ecldata1.ecl
+
+# 将目录递归打包；归档内文件名使用正斜杠并按字节排序
+.\thdat-nc.exe -c C:\temp\new.dat C:\temp\new
+
+# 查看完整命令帮助
+.\thdat-nc.exe -h
 ```
+
+打包器只在 Zstandard 结果小于原文件时采用压缩，否则原样存储。输出采用 16 字节
+payload 对齐，且相同归档文件名和相同输入内容会产生逐字节相同的结果。
+
+## 打包 seed 的已知局限
+
+原版工具生成每条目 32 位 seed 的算法目前未知。我们检查过的 1,783 个原版条目 seed
+全部唯一，但它们不匹配已测试的文件名 CRC32、内容 CRC32、Adler32、XXH32、FNV-1a
+或简单相邻 LCG 关系；相同内容在不同归档中也可拥有不同 seed。因此无法声称已经复现
+官方 seed 生成器。
+
+本工具用 `CRC32(归档内文件名 + NUL + 原始文件内容)` 生成确定性 seed。已知读取逻辑只把
+该字段用作 payload XOR 密钥，并不把它当作校验和；由本工具进行的打包→解包回归已经
+通过。但这个选择只是格式兼容方案，并非已知的官方算法，生成的归档也尚未宣称经过游戏
+本体的全面兼容性验证。请保留原文件备份并在副本上测试。
 
 ## Linux 构建与测试
 
@@ -70,9 +91,9 @@ Windows 二进制静态链接 Zstandard，其 BSD 许可证见 [`LICENSES/zstd.t
 # thdat-nc (English)
 
 `thdat-nc` is an experimental command-line reader for `PKGL` archives. Its interface follows
-the familiar THTK `thdat` conventions: `-l` lists entries and `-x` extracts them. It currently
-supports directory decryption, per-entry payload decryption, Zstandard decompression, full
-extraction, and extraction of selected files. Archive creation and modification are not supported.
+the familiar THTK `thdat` conventions: `-l` lists entries, `-x` extracts them, and `-c` creates an
+archive from a directory. It supports directory and payload encryption/decryption, Zstandard
+compression/decompression, full or selected extraction, and deterministic PKGL creation.
 
 The format implementation was independently derived from a researcher-owned game copy. The test
 suite generates a tiny original PKGL fixture at runtime; this repository contains no game archive,
@@ -101,7 +122,30 @@ sha256sum -c SHA256SUMS
 
 # Extract one file
 .\thdat-nc.exe -x -C C:\temp\th06ST C:\games\th06nc\data\th06ST.dat ecldata1.ecl
+
+# Recursively pack a directory
+.\thdat-nc.exe -c C:\temp\new.dat C:\temp\new
+
+# Show complete command help
+.\thdat-nc.exe -h
 ```
+
+The creator uses Zstandard only when the compressed result is smaller than the original. Payloads
+are 16-byte aligned. Identical input content and the same output archive basename produce a
+byte-for-byte reproducible archive.
+
+## Known packing-seed limitation
+
+The algorithm used by the original tool to generate each entry's 32-bit seed is unknown. All 1,783
+observed seeds were unique, but they matched none of the tested filename/content CRC32, Adler32,
+XXH32, FNV-1a, or simple adjacent-LCG hypotheses. Identical content can also have different seeds
+in different original archives. We therefore cannot claim to reproduce the official generator.
+
+This packer uses `CRC32(archive entry name + NUL + original file content)` as a deterministic seed.
+The known reader uses this field only as the payload XOR key, not as a checksum, and this tool's
+pack-to-extract round-trip tests pass. This is a compatible engineering choice, not the known
+official algorithm, and generated archives are not claimed to have comprehensive in-game
+compatibility testing. Keep backups and test on copies.
 
 ## Linux build and tests
 

@@ -81,6 +81,36 @@ def write_fixture(path: Path) -> dict[str, bytes]:
     return expected
 
 
+def read_directory_records(path: Path) -> tuple[bytes, list[dict[str, int | str]]]:
+    archive = path.read_bytes()
+    if archive[:4] != b"PKGL":
+        raise AssertionError("created archive has no PKGL magic")
+    index_size = struct.unpack_from("<I", archive, 4)[0]
+    encrypted = archive[8 : 8 + index_size]
+    seed = zlib.crc32(path.stem.encode("ascii")) & 0xFFFFFFFF
+    directory = crypt(encrypted, seed)
+    records = []
+    cursor = 0
+    while cursor < len(directory):
+        flags, checksum, size, stored_size, offset, name_size = struct.unpack_from(
+            "<HIQQQH", directory, cursor
+        )
+        cursor += 32
+        name = directory[cursor : cursor + name_size].decode("utf-8")
+        cursor += name_size
+        records.append(
+            {
+                "name": name,
+                "flags": flags,
+                "checksum": checksum,
+                "size": size,
+                "stored_size": stored_size,
+                "offset": offset,
+            }
+        )
+    return archive, records
+
+
 def run_tool(*arguments: str) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run([str(LINUX_BINARY), *arguments], text=True, capture_output=True)
@@ -89,6 +119,15 @@ def run_tool(*arguments: str) -> subprocess.CompletedProcess[str]:
 
 
 class ThdatNcCliTests(unittest.TestCase):
+    def test_help_documents_all_modes(self):
+        result = run_tool("-h")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-c ARCHIVE INPUT-DIRECTORY", result.stdout)
+        self.assertIn("-l", result.stdout)
+        self.assertIn("-x", result.stdout)
+        self.assertIn("-C", result.stdout)
+
     def test_lists_and_extracts_owned_fixture(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -109,6 +148,70 @@ class ThdatNcCliTests(unittest.TestCase):
                 {path.name: path.read_bytes() for path in output.iterdir()},
                 expected,
             )
+
+    def test_create_roundtrips_with_canonical_layout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            (source / "nested").mkdir(parents=True)
+            expected = {
+                "nested/compressible.bin": b"A" * 4096,
+                "plain.bin": bytes(range(256)),
+            }
+            for name, payload in expected.items():
+                path = source / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(payload)
+            archive = root / "packed.dat"
+            output = root / "output"
+
+            creation = run_tool("-c", str(archive), str(source))
+            extraction = run_tool("-x", "-C", str(output), str(archive))
+
+            self.assertEqual(creation.returncode, 0, creation.stderr)
+            self.assertEqual(extraction.returncode, 0, extraction.stderr)
+            self.assertEqual(
+                {
+                    path.relative_to(output).as_posix(): path.read_bytes()
+                    for path in output.rglob("*")
+                    if path.is_file()
+                },
+                expected,
+            )
+            archive_bytes, records = read_directory_records(archive)
+            self.assertEqual([record["name"] for record in records], list(expected))
+            self.assertEqual([record["flags"] for record in records], [1, 0])
+            self.assertEqual(
+                [record["checksum"] for record in records],
+                [0xE95B5568, 0x9F1DC070],
+            )
+            self.assertTrue(all(record["offset"] % 16 == 0 for record in records))
+            first_offset = int(records[0]["offset"])
+            index_end = 8 + struct.unpack_from("<I", archive_bytes, 4)[0]
+            self.assertEqual(set(archive_bytes[index_end:first_offset]), {0})
+            first_end = first_offset + int(records[0]["stored_size"])
+            second_offset = int(records[1]["offset"])
+            self.assertEqual(set(archive_bytes[first_end:second_offset]), {0})
+            second_end = second_offset + int(records[1]["stored_size"])
+            self.assertEqual(archive_bytes[second_end:], b"\0")
+
+    def test_create_is_reproducible_for_the_same_archive_name(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "content.bin").write_bytes(b"repeatable" * 100)
+            first = root / "one" / "same.dat"
+            second = root / "two" / "same.dat"
+            first.parent.mkdir()
+            second.parent.mkdir()
+
+            first_result = run_tool("-c", str(first), str(source))
+            second_result = run_tool("-c", str(second), str(source))
+
+            self.assertEqual(first_result.returncode, 0, first_result.stderr)
+            self.assertEqual(second_result.returncode, 0, second_result.stderr)
+            self.assertEqual(first.read_bytes(), second.read_bytes())
 
 
 class ThdatNcWindowsArtifactTests(unittest.TestCase):

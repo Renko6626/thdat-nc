@@ -15,9 +15,12 @@
 
 #ifdef _WIN32
 #include <direct.h>
+#include <windows.h>
 #include <zstd.h>
 #else
+#include <dirent.h>
 #include <dlfcn.h>
+#include <unistd.h>
 #endif
 
 typedef struct {
@@ -35,8 +38,27 @@ typedef struct {
     size_t entry_count;
 } pkgl_archive_t;
 
+typedef struct {
+    char* name;
+    unsigned char* data;
+    unsigned char* stored;
+    size_t size;
+    size_t stored_size;
+    uint64_t offset;
+    uint32_t seed;
+    uint16_t flags;
+} input_file_t;
+
+typedef struct {
+    input_file_t* files;
+    size_t count;
+    size_t capacity;
+} input_list_t;
+
 #ifndef _WIN32
 typedef size_t (*zstd_decompress_t)(void*, size_t, const void*, size_t);
+typedef size_t (*zstd_compress_bound_t)(size_t);
+typedef size_t (*zstd_compress_t)(void*, size_t, const void*, size_t, int);
 typedef unsigned int (*zstd_is_error_t)(size_t);
 typedef const char* (*zstd_get_error_name_t)(size_t);
 #endif
@@ -58,6 +80,20 @@ static uint64_t
 read_u64(const unsigned char* data)
 {
     return (uint64_t)read_u32(data) | (uint64_t)read_u32(data + 4) << 32;
+}
+
+static void
+write_u16(unsigned char* data, uint16_t value)
+{
+    data[0] = (unsigned char)value;
+    data[1] = (unsigned char)(value >> 8);
+}
+
+static void
+write_u32(unsigned char* data, uint32_t value)
+{
+    for (unsigned int i = 0; i < 4; ++i)
+        data[i] = (unsigned char)(value >> (i * 8));
 }
 
 static void
@@ -88,15 +124,20 @@ xor_key(uint32_t seed, unsigned char key[16])
 }
 
 static uint32_t
-crc32_bytes(const unsigned char* data, size_t size)
+crc32_update(uint32_t crc, const unsigned char* data, size_t size)
 {
-    uint32_t crc = UINT32_MAX;
     for (size_t i = 0; i < size; ++i) {
         crc ^= data[i];
         for (unsigned int bit = 0; bit < 8; ++bit)
             crc = (crc >> 1) ^ (UINT32_C(0xedb88320) & (uint32_t)-(int32_t)(crc & 1));
     }
-    return crc ^ UINT32_MAX;
+    return crc;
+}
+
+static uint32_t
+crc32_bytes(const unsigned char* data, size_t size)
+{
+    return crc32_update(UINT32_MAX, data, size) ^ UINT32_MAX;
 }
 
 static uint32_t
@@ -405,14 +446,435 @@ extract_entry(pkgl_archive_t* archive, const pkgl_entry_t* entry, const char* ou
     return 1;
 }
 
+static char*
+copy_string(const char* value)
+{
+    size_t size = strlen(value) + 1;
+    char* result = malloc(size);
+    if (result)
+        memcpy(result, value, size);
+    return result;
+}
+
+static char*
+join_path(const char* left, const char* right, char separator)
+{
+    size_t left_size = strlen(left);
+    size_t right_size = strlen(right);
+    int needs_separator = left_size && left[left_size - 1] != '/' && left[left_size - 1] != '\\';
+    char* result = malloc(left_size + right_size + (size_t)needs_separator + 1);
+    if (!result)
+        return NULL;
+    memcpy(result, left, left_size);
+    if (needs_separator)
+        result[left_size++] = separator;
+    memcpy(result + left_size, right, right_size + 1);
+    return result;
+}
+
+static unsigned char*
+read_whole_file(const char* path, size_t* size)
+{
+    FILE* stream = fopen(path, "rb");
+    if (!stream) {
+        fprintf(stderr, "thdat-nc: cannot open input %s: %s\n", path, strerror(errno));
+        return NULL;
+    }
+#ifdef _WIN32
+    if (_fseeki64(stream, 0, SEEK_END) || _ftelli64(stream) < 0) {
+        fclose(stream);
+        return NULL;
+    }
+    int64_t length = _ftelli64(stream);
+    if ((uint64_t)length > SIZE_MAX || _fseeki64(stream, 0, SEEK_SET)) {
+#else
+    if (fseeko(stream, 0, SEEK_END)) {
+        fclose(stream);
+        return NULL;
+    }
+    off_t length = ftello(stream);
+    if (length < 0 || (uint64_t)length > SIZE_MAX || fseeko(stream, 0, SEEK_SET)) {
+#endif
+        fprintf(stderr, "thdat-nc: input is too large: %s\n", path);
+        fclose(stream);
+        return NULL;
+    }
+    *size = (size_t)length;
+    unsigned char* data = malloc(*size ? *size : 1);
+    if (!data || fread(data, 1, *size, stream) != *size) {
+        fprintf(stderr, "thdat-nc: cannot read input %s\n", path);
+        free(data);
+        fclose(stream);
+        return NULL;
+    }
+    fclose(stream);
+    return data;
+}
+
+static int
+append_input_file(input_list_t* list, const char* root, const char* name)
+{
+    size_t name_size = strlen(name);
+    if (!name_size || name_size > 255) {
+        fprintf(stderr, "thdat-nc: input name must contain 1 to 255 bytes: %s\n", name);
+        return 0;
+    }
+    if (list->count == list->capacity) {
+        size_t next_capacity = list->capacity ? list->capacity * 2 : 32;
+        input_file_t* next = realloc(list->files, next_capacity * sizeof(*next));
+        if (!next) {
+            fprintf(stderr, "thdat-nc: out of memory\n");
+            return 0;
+        }
+        list->files = next;
+        list->capacity = next_capacity;
+    }
+#ifdef _WIN32
+    char* path = join_path(root, name, '\\');
+    if (path) {
+        for (char* cursor = path + strlen(root); *cursor; ++cursor)
+            if (*cursor == '/')
+                *cursor = '\\';
+    }
+#else
+    char* path = join_path(root, name, '/');
+#endif
+    if (!path)
+        return 0;
+    input_file_t* file = &list->files[list->count];
+    memset(file, 0, sizeof(*file));
+    file->name = copy_string(name);
+    file->data = read_whole_file(path, &file->size);
+    free(path);
+    if (!file->name || !file->data) {
+        free(file->name);
+        free(file->data);
+        memset(file, 0, sizeof(*file));
+        return 0;
+    }
+    ++list->count;
+    return 1;
+}
+
+#ifdef _WIN32
+static int
+collect_inputs(input_list_t* list, const char* root, const char* relative)
+{
+    char* directory = *relative ? join_path(root, relative, '\\') : copy_string(root);
+    if (!directory)
+        return 0;
+    for (char* cursor = directory + strlen(root); *cursor; ++cursor)
+        if (*cursor == '/')
+            *cursor = '\\';
+    char* pattern = join_path(directory, "*", '\\');
+    free(directory);
+    if (!pattern)
+        return 0;
+    WIN32_FIND_DATAA found;
+    HANDLE search = FindFirstFileA(pattern, &found);
+    free(pattern);
+    if (search == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "thdat-nc: cannot enumerate input directory: %s\n", relative);
+        return 0;
+    }
+    int ok = 1;
+    do {
+        if (!strcmp(found.cFileName, ".") || !strcmp(found.cFileName, ".."))
+            continue;
+        char* child = *relative ? join_path(relative, found.cFileName, '/') : copy_string(found.cFileName);
+        if (!child) {
+            ok = 0;
+            break;
+        }
+        if (found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+            fprintf(stderr, "thdat-nc: skipping reparse point: %s\n", child);
+        } else if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            ok = collect_inputs(list, root, child);
+        } else {
+            ok = append_input_file(list, root, child);
+        }
+        free(child);
+    } while (ok && FindNextFileA(search, &found));
+    FindClose(search);
+    return ok;
+}
+#else
+static int
+collect_inputs(input_list_t* list, const char* root, const char* relative)
+{
+    char* directory = *relative ? join_path(root, relative, '/') : copy_string(root);
+    if (!directory)
+        return 0;
+    DIR* stream = opendir(directory);
+    if (!stream) {
+        fprintf(stderr, "thdat-nc: cannot open input directory %s: %s\n", directory, strerror(errno));
+        free(directory);
+        return 0;
+    }
+    int ok = 1;
+    struct dirent* item;
+    while (ok && (item = readdir(stream)) != NULL) {
+        if (!strcmp(item->d_name, ".") || !strcmp(item->d_name, ".."))
+            continue;
+        char* child = *relative ? join_path(relative, item->d_name, '/') : copy_string(item->d_name);
+        char* path = child ? join_path(root, child, '/') : NULL;
+        struct stat status;
+        if (!child || !path || lstat(path, &status)) {
+            fprintf(stderr, "thdat-nc: cannot inspect input: %s\n", child ? child : item->d_name);
+            ok = 0;
+        } else if (S_ISDIR(status.st_mode)) {
+            ok = collect_inputs(list, root, child);
+        } else if (S_ISREG(status.st_mode)) {
+            ok = append_input_file(list, root, child);
+        } else if (S_ISLNK(status.st_mode)) {
+            fprintf(stderr, "thdat-nc: skipping symbolic link: %s\n", child);
+        }
+        free(path);
+        free(child);
+    }
+    closedir(stream);
+    free(directory);
+    return ok;
+}
+#endif
+
+static int
+compare_inputs(const void* left, const void* right)
+{
+    return strcmp(((const input_file_t*)left)->name, ((const input_file_t*)right)->name);
+}
+
+static void
+free_inputs(input_list_t* list)
+{
+    for (size_t i = 0; i < list->count; ++i) {
+        free(list->files[i].name);
+        free(list->files[i].data);
+        free(list->files[i].stored);
+    }
+    free(list->files);
+    memset(list, 0, sizeof(*list));
+}
+
+static uint32_t
+input_seed(const input_file_t* file)
+{
+    uint32_t crc = crc32_update(UINT32_MAX, (const unsigned char*)file->name, strlen(file->name));
+    const unsigned char zero = 0;
+    crc = crc32_update(crc, &zero, 1);
+    return crc32_update(crc, file->data, file->size) ^ UINT32_MAX;
+}
+
+static int
+compress_inputs(input_list_t* list)
+{
+#ifndef _WIN32
+    void* library = dlopen("libzstd.so.1", RTLD_NOW | RTLD_LOCAL);
+    zstd_compress_bound_t compress_bound = NULL;
+    zstd_compress_t compress = NULL;
+    zstd_is_error_t is_error = NULL;
+    zstd_get_error_name_t error_name = NULL;
+    if (library) {
+        *(void**)&compress_bound = dlsym(library, "ZSTD_compressBound");
+        *(void**)&compress = dlsym(library, "ZSTD_compress");
+        *(void**)&is_error = dlsym(library, "ZSTD_isError");
+        *(void**)&error_name = dlsym(library, "ZSTD_getErrorName");
+    }
+    if (!library || !compress_bound || !compress || !is_error || !error_name) {
+        fprintf(stderr, "thdat-nc: cannot load complete Zstd runtime\n");
+        if (library)
+            dlclose(library);
+        return 0;
+    }
+#endif
+    int ok = 1;
+    for (size_t i = 0; i < list->count; ++i) {
+        input_file_t* file = &list->files[i];
+#ifdef _WIN32
+        size_t bound = ZSTD_compressBound(file->size);
+#else
+        size_t bound = compress_bound(file->size);
+#endif
+        unsigned char* candidate = malloc(bound ? bound : 1);
+        if (!candidate) {
+            ok = 0;
+            break;
+        }
+#ifdef _WIN32
+        size_t result = ZSTD_compress(candidate, bound, file->data, file->size, 3);
+        int failed = ZSTD_isError(result);
+        const char* failure = failed ? ZSTD_getErrorName(result) : NULL;
+#else
+        size_t result = compress(candidate, bound, file->data, file->size, 3);
+        int failed = is_error(result);
+        const char* failure = failed ? error_name(result) : NULL;
+#endif
+        if (failed) {
+            fprintf(stderr, "thdat-nc: Zstd encode failed for %s: %s\n", file->name, failure);
+            free(candidate);
+            ok = 0;
+            break;
+        }
+        if (result < file->size) {
+            file->stored = candidate;
+            file->stored_size = result;
+            file->flags = 1;
+        } else {
+            free(candidate);
+            file->stored = malloc(file->size ? file->size : 1);
+            if (!file->stored) {
+                ok = 0;
+                break;
+            }
+            memcpy(file->stored, file->data, file->size);
+            file->stored_size = file->size;
+        }
+        file->seed = input_seed(file);
+    }
+#ifndef _WIN32
+    dlclose(library);
+#endif
+    if (!ok)
+        fprintf(stderr, "thdat-nc: out of memory while preparing archive\n");
+    return ok;
+}
+
+static uint64_t
+align16(uint64_t value)
+{
+    return (value + 15) & ~UINT64_C(15);
+}
+
+static int
+write_zeros(FILE* stream, uint64_t count)
+{
+    static const unsigned char zeros[16] = {0};
+    while (count) {
+        size_t chunk = count > sizeof(zeros) ? sizeof(zeros) : (size_t)count;
+        if (fwrite(zeros, 1, chunk, stream) != chunk)
+            return 0;
+        count -= chunk;
+    }
+    return 1;
+}
+
+static int
+archive_create(const char* output_path, const char* input_root)
+{
+    input_list_t list = {0};
+    unsigned char* directory = NULL;
+    FILE* output = NULL;
+    int ok = 0;
+    struct stat root_status;
+    if (stat(input_root, &root_status) || !S_ISDIR(root_status.st_mode)) {
+        fprintf(stderr, "thdat-nc: input is not a directory: %s\n", input_root);
+        goto done;
+    }
+    if (!collect_inputs(&list, input_root, "") || !list.count) {
+        if (!list.count)
+            fprintf(stderr, "thdat-nc: input directory contains no regular files\n");
+        goto done;
+    }
+    qsort(list.files, list.count, sizeof(*list.files), compare_inputs);
+    if (!compress_inputs(&list))
+        goto done;
+
+    uint64_t directory_size64 = 0;
+    for (size_t i = 0; i < list.count; ++i)
+        directory_size64 += 32 + strlen(list.files[i].name);
+    if (directory_size64 > UINT32_MAX) {
+        fprintf(stderr, "thdat-nc: archive directory is too large\n");
+        goto done;
+    }
+    uint32_t directory_size = (uint32_t)directory_size64;
+    uint64_t next_offset = align16(8 + directory_size64);
+    for (size_t i = 0; i < list.count; ++i) {
+        list.files[i].offset = next_offset;
+        if (UINT64_MAX - next_offset < list.files[i].stored_size) {
+            fprintf(stderr, "thdat-nc: archive is too large\n");
+            goto done;
+        }
+        next_offset += list.files[i].stored_size;
+        if (i + 1 < list.count)
+            next_offset = align16(next_offset);
+    }
+
+    directory = malloc(directory_size ? directory_size : 1);
+    if (!directory)
+        goto done;
+    size_t cursor = 0;
+    for (size_t i = 0; i < list.count; ++i) {
+        input_file_t* file = &list.files[i];
+        size_t name_size = strlen(file->name);
+        write_u16(directory + cursor, file->flags);
+        write_u32(directory + cursor + 2, file->seed);
+        write_u64(directory + cursor + 6, file->size);
+        write_u64(directory + cursor + 14, file->stored_size);
+        write_u64(directory + cursor + 22, file->offset);
+        write_u16(directory + cursor + 30, (uint16_t)name_size);
+        memcpy(directory + cursor + 32, file->name, name_size);
+        cursor += 32 + name_size;
+    }
+    unsigned char key[16];
+    xor_key(archive_seed(output_path), key);
+    for (size_t i = 0; i < directory_size; ++i)
+        directory[i] ^= key[i & 15];
+
+    output = fopen(output_path, "wb");
+    if (!output) {
+        fprintf(stderr, "thdat-nc: cannot create %s: %s\n", output_path, strerror(errno));
+        goto done;
+    }
+    unsigned char header[8] = {'P', 'K', 'G', 'L'};
+    write_u32(header + 4, directory_size);
+    if (fwrite(header, 1, sizeof(header), output) != sizeof(header) ||
+        fwrite(directory, 1, directory_size, output) != directory_size ||
+        !write_zeros(output, list.files[0].offset - 8 - directory_size))
+        goto write_fail;
+    for (size_t i = 0; i < list.count; ++i) {
+        input_file_t* file = &list.files[i];
+        xor_key(file->seed, key);
+        for (size_t byte = 0; byte < file->stored_size; ++byte)
+            file->stored[byte] ^= key[byte & 15];
+        if (fwrite(file->stored, 1, file->stored_size, output) != file->stored_size)
+            goto write_fail;
+        if (i + 1 < list.count &&
+            !write_zeros(output, list.files[i + 1].offset - file->offset - file->stored_size))
+            goto write_fail;
+        printf("%s\n", file->name);
+    }
+    if (fputc(0, output) == EOF || fclose(output)) {
+        output = NULL;
+        goto write_fail;
+    }
+    output = NULL;
+    ok = 1;
+    goto done;
+
+write_fail:
+    fprintf(stderr, "thdat-nc: cannot write %s: %s\n", output_path, strerror(errno));
+done:
+    if (output)
+        fclose(output);
+    free(directory);
+    free_inputs(&list);
+    return ok;
+}
+
 static void
 usage(FILE* stream)
 {
     fprintf(stream,
-        "Usage: thdat-nc (-l | -x) [-C DIR] ARCHIVE [FILE...]\n"
+        "Usage:\n"
+        "  thdat-nc -c ARCHIVE INPUT-DIRECTORY\n"
+        "  thdat-nc -l ARCHIVE\n"
+        "  thdat-nc -x [-C DIR] ARCHIVE [FILE...]\n"
+        "  thdat-nc -h\n"
+        "  -c  create a deterministic PKGL archive\n"
         "  -l  list PKGL archive entries\n"
         "  -x  extract all or selected entries\n"
-        "  -C  extract below DIR (default: current directory)\n");
+        "  -C  extract below DIR (default: current directory)\n"
+        "  -h  show this help\n");
 }
 
 int
@@ -421,8 +883,9 @@ main(int argc, char** argv)
     int mode = 0;
     const char* output_root = ".";
     int option;
-    while ((option = getopt(argc, argv, "lxC:h")) != -1) {
+    while ((option = getopt(argc, argv, "clxC:h")) != -1) {
         switch (option) {
+        case 'c': mode = 'c'; break;
         case 'l': mode = 'l'; break;
         case 'x': mode = 'x'; break;
         case 'C': output_root = optarg; break;
@@ -433,6 +896,14 @@ main(int argc, char** argv)
     if (!mode || optind >= argc) {
         usage(stderr);
         return 2;
+    }
+
+    if (mode == 'c') {
+        if (optind + 2 != argc) {
+            usage(stderr);
+            return 2;
+        }
+        return archive_create(argv[optind], argv[optind + 1]) ? 0 : 1;
     }
 
     pkgl_archive_t archive;
