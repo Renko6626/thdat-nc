@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+"""Black-box tests for thdat-nc.
+
+The fixture is generated here from an independent Python re-implementation of the
+key schedule (mix64 / xor_key), so a mistake copied between the C code and the
+test cannot cancel out silently. No game bytes are involved.
+
+The pack tests pin the exact output layout (sort order, seeds, 16-byte alignment,
+trailing zero byte): a change in any of them is a format change, not a refactor.
+"""
 
 import os
 import struct
@@ -20,6 +29,7 @@ COMPRESSED_PAYLOAD = bytes.fromhex(
 )
 
 
+# Mirrors key_from_seed() in src/thdat-nc.c.
 def mix64(value: int) -> int:
     value ^= value >> 30
     value = value * 0xBF58476D1CE4E5B9 & MASK64
@@ -43,6 +53,7 @@ def crypt(data: bytes, seed: int) -> bytes:
 
 
 def write_fixture(path: Path) -> dict[str, bytes]:
+    """Writes a two-entry archive (one raw, one zstd) and returns name -> content."""
     entries = [
         ("plain.txt", 0, 0x10203040, b"plain fixture payload\n", b"plain fixture payload\n"),
         (
@@ -82,6 +93,7 @@ def write_fixture(path: Path) -> dict[str, bytes]:
 
 
 def read_directory_records(path: Path) -> tuple[bytes, list[dict[str, int | str]]]:
+    """Decrypts and parses the directory of an archive written by the tool."""
     archive = path.read_bytes()
     if archive[:4] != b"PKGL":
         raise AssertionError("created archive has no PKGL magic")
@@ -181,9 +193,10 @@ class ThdatNcCliTests(unittest.TestCase):
             archive_bytes, records = read_directory_records(archive)
             self.assertEqual([record["name"] for record in records], list(expected))
             self.assertEqual([record["flags"] for record in records], [1, 0])
+            # Every packed entry gets the placeholder seed "poo" (see pkgl.h).
             self.assertEqual(
                 [record["checksum"] for record in records],
-                [0xE95B5568, 0x9F1DC070],
+                [0x006F6F70, 0x006F6F70],
             )
             self.assertTrue(all(record["offset"] % 16 == 0 for record in records))
             first_offset = int(records[0]["offset"])
@@ -228,6 +241,14 @@ class ThdatNcWindowsArtifactTests(unittest.TestCase):
         self.assertIn("x86-64", description)
         self.assertNotIn("zstd.dll", imports)
         self.assertNotIn("libzstd", imports)
+
+    def test_windows_release_matches_sha256sums(self):
+        """Catches a rebuilt exe whose checksum file was not refreshed (or vice versa)."""
+        result = subprocess.run(
+            ["sha256sum", "-c", "SHA256SUMS"], cwd=ROOT, text=True, capture_output=True
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

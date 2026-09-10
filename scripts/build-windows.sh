@@ -47,9 +47,9 @@ make -C "$zstd_dir/lib" libzstd.a -j2 \
   CFLAGS='-O2 -DNDEBUG'
 
 "$compiler" \
-  -std=c11 -O2 -DNDEBUG -Wall -Wextra -Werror -static -s \
+  -std=c11 -O2 -DNDEBUG -D_FILE_OFFSET_BITS=64 -Wall -Wextra -Werror -static -s \
   -I"$zstd_dir/lib" \
-  "$project_dir/src/thdat-nc.c" "$zstd_dir/lib/libzstd.a" \
+  "$project_dir"/src/*.c "$zstd_dir/lib/libzstd.a" \
   -o "$output_dir/thdat-nc.exe"
 
 sha256sum "$output_dir/thdat-nc.exe"
